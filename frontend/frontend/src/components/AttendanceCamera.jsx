@@ -128,17 +128,26 @@ function AttendanceCamera() {
           }
         });
 
-        // Throttle network: post only when not already posting
+        // Throttle network: when faces detected, send a snapshot to backend
         if (detections.length > 0 && !isPosting) {
           isPosting = true;
-          // Limit number of faces sent to reduce payload
-          const limited = detections.slice(0, FACE_DETECTION_CONFIG.processing.maxFaces);
-          const encodings = limited.map(d => Array.from(d.descriptor));
           try {
-            const res = await axios.post('http://localhost:8000/mark_attendance_batch', { encodings });
-            setRecognized(res.data.recognized || []);
+            // Capture current frame as JPEG
+            const dataUrl = webcamRef.current.getScreenshot({ width: displaySize.width, height: displaySize.height });
+            if (dataUrl) {
+              const blob = await (await fetch(dataUrl)).blob();
+              const form = new FormData();
+              form.append('image', blob, 'frame.jpg');
+              // Optional: send custom time if needed
+              // form.append('custom_time', new Date().toISOString());
+              const res = await axios.post('http://localhost:8000/process_media_attendance', form, {
+                headers: { 'Content-Type': 'multipart/form-data' }
+              });
+              setRecognized(res.data.recognized || []);
+            } else {
+              setRecognized([]);
+            }
           } catch (err) {
-            // Treat failures as no recognized faces without spamming errors
             setRecognized([]);
           } finally {
             isPosting = false;

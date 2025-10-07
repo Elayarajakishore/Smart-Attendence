@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 
 import StudentRegister from './components/StudentRegister';
 import AttendanceCamera from './components/AttendanceCamera';
+import RTSPCamera from './components/RTSPCamera';
 import AttendanceList from './components/AttendanceList';
 import StudentManagement from './components/StudentManagement';
 import Dashboard from './components/Dashboard';
@@ -36,6 +37,8 @@ function App() {
         return <StudentRegister />;
       case 'Mark Attendance':
         return <AttendanceCamera />;
+      case 'RTSP Camera':
+        return <RTSPCamera />;
       case 'Attendance List':
         return <AttendanceList />;
       case 'Student Management':
@@ -62,6 +65,7 @@ function App() {
                   'Dashboard',
                   'Register Student',
                   'Mark Attendance',
+                  'RTSP Camera',
                   'Media Attendance',
                   'Attendance List',
                   'Student Management',

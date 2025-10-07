@@ -10,28 +10,13 @@ import os
 from datetime import datetime, timedelta
 from typing import List
 from bson import ObjectId
-from twilio.rest import Client
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from config import RTSP_URL, RTSP_SCAN_INTERVAL_MS, RTSP_FRAME_SKIP, ATTENDANCE_START_AFTER, MONGODB_URL, DATABASE_NAME
 
 load_dotenv()  # Load .env file
 
 router = APIRouter()
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP = os.getenv("TWILIO_WHATSAPP")
-twilio_client = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
-
-def send_whatsapp_message(to_number: str, message: str):
-    try:
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP,
-            body=message,
-            to=f"whatsapp:{to_number}"
-        )
-        print(f"✅ WhatsApp sent to {to_number}")
-    except Exception as e:
-        print("❌ WhatsApp error:", str(e))
 
 
 app = FastAPI()
@@ -46,8 +31,8 @@ app.add_middleware(
 )
 
 # MongoDB setup
-client = MongoClient("mongodb://localhost:27017/")
-db = client["face_reco"]
+client = MongoClient(MONGODB_URL)
+db = client[DATABASE_NAME]
 students_col = db["students"]
 attendance_col = db["attendance"]
 
@@ -388,6 +373,58 @@ def get_attendance():
         r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
     return records
 
+@app.get("/rtsp/check_now")
+def rtsp_check_now():
+    if not RTSP_URL:
+        return JSONResponse(status_code=400, content={"error": "RTSP_URL not configured"})
+    try:
+        cap = cv2.VideoCapture(RTSP_URL)
+        if not cap.isOpened():
+            return JSONResponse(status_code=500, content={"error": "Failed to open RTSP stream"})
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return JSONResponse(status_code=500, content={"error": "Failed to read frame from RTSP stream"})
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb, number_of_times_to_upsample=1)
+        face_encodings = face_recognition.face_encodings(rgb, face_locations)
+
+        if not face_encodings:
+            return {"faces_detected": 0, "recognized": []}
+
+        # Load students and compare
+        students = list(students_col.find())
+        tolerance = 0.25
+        confidence_threshold = 0.75
+        recognized = []
+
+        for enc in face_encodings:
+            best = None
+            best_distance = float('inf')
+            best_conf = 0
+            for s in students:
+                try:
+                    known = np.array(s["face_encoding"])
+                    distance = face_recognition.face_distance([known], enc)[0]
+                    conf = (1 - distance) * 100
+                except Exception:
+                    continue
+                if distance < best_distance and distance <= tolerance and conf >= confidence_threshold:
+                    best_distance = distance
+                    best_conf = conf
+                    best = s
+            if best:
+                recognized.append({
+                    "roll": best["roll"],
+                    "name": best["name"],
+                    "confidence": best_conf
+                })
+
+        return {"faces_detected": len(face_encodings), "recognized": recognized}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.get("/attendance_by_hour")
 def attendance_by_hour(
     hour: str = Query(..., description="Hour in format HH:00 (24h, e.g. 09:00)"),
@@ -422,11 +459,6 @@ def attendance_by_hour(
                 "name": s["name"],
                 "photo_b64": s.get("photo_b64", None)
             })
-            # ✅ Send WhatsApp "Present"
-            send_whatsapp_message(
-                s["phone"],
-                f"Hello {s['name']} ({s['roll']}), your attendance for {hour} is marked as ✅ Present."
-            )
         else:
             print(f"Warning: Student with roll {r} not found in students collection")
 
@@ -437,11 +469,6 @@ def attendance_by_hour(
                 "name": s["name"],
                 "photo_b64": s.get("photo_b64", None)
             })
-            # ✅ Send WhatsApp "Absent"
-            send_whatsapp_message(
-                s["phone"],
-                f"Hello {s['name']} ({s['roll']}), your attendance for {hour} is marked as ❌ Absent."
-            )
 
     return {"present": present, "absent": absent}
 
@@ -589,6 +616,159 @@ def get_staff_emails():
     """Debug endpoint to see all staff emails"""
     staffs = list(staffs_col.find({}, {"email": 1, "name": 1}))
     return {"staffs": staffs}
+
+# ==== RTSP worker wiring ====
+try:
+    from .rtsp_worker import RtspAttendanceWorker
+except ImportError:
+    # Fallback when running as a script: python app.py
+    from rtsp_worker import RtspAttendanceWorker
+
+# Configuration loaded from config.py
+_start_after_dt = None
+if ATTENDANCE_START_AFTER:
+    try:
+        _start_after_dt = datetime.fromisoformat(ATTENDANCE_START_AFTER)
+    except Exception:
+        _start_after_dt = None
+_rtsp_worker = None
+
+@app.on_event("startup")
+def _maybe_start_rtsp():
+    global _rtsp_worker
+    if RTSP_URL:
+        _rtsp_worker = RtspAttendanceWorker(
+            RTSP_URL, db, interval_ms=RTSP_SCAN_INTERVAL_MS, frame_skip=RTSP_FRAME_SKIP, start_after=_start_after_dt
+        )
+        _rtsp_worker.start()
+
+@app.on_event("shutdown")
+def _stop_rtsp():
+    if _rtsp_worker:
+        _rtsp_worker.stop()
+
+@app.post("/rtsp/start")
+def rtsp_start():
+    global _rtsp_worker
+    if _rtsp_worker and _rtsp_worker.status().get("running"):
+        return {"message": "RTSP worker already running"}
+    if not RTSP_URL:
+        return JSONResponse(status_code=400, content={"error": "RTSP_URL not configured"})
+    _rtsp_worker = RtspAttendanceWorker(
+        RTSP_URL, db, interval_ms=RTSP_SCAN_INTERVAL_MS, frame_skip=RTSP_FRAME_SKIP, start_after=_start_after_dt
+    )
+    started = _rtsp_worker.start()
+    if not started:
+        return JSONResponse(status_code=500, content={"error": "Failed to start worker"})
+    return {"message": "RTSP worker started"}
+
+@app.post("/rtsp/stop")
+def rtsp_stop():
+    if not _rtsp_worker:
+        return {"message": "RTSP worker not running"}
+    _rtsp_worker.stop()
+    return {"message": "RTSP worker stopped"}
+
+@app.get("/rtsp/status")
+def rtsp_status():
+    if not _rtsp_worker:
+        return {"running": False}
+    return _rtsp_worker.status()
+
+@app.post("/rtsp/mark_attendance_now")
+def rtsp_mark_attendance_now():
+    """Manually trigger attendance marking from RTSP stream right now"""
+    if not RTSP_URL:
+        return JSONResponse(status_code=400, content={"error": "RTSP_URL not configured"})
+    
+    try:
+        cap = cv2.VideoCapture(RTSP_URL)
+        if not cap.isOpened():
+            return JSONResponse(status_code=500, content={"error": "Failed to open RTSP stream"})
+        
+        # Read a frame
+        ret, frame = cap.read()
+        cap.release()
+        
+        if not ret or frame is None:
+            return JSONResponse(status_code=500, content={"error": "Failed to read frame from RTSP stream"})
+
+        # Process the frame for face recognition
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_locations = face_recognition.face_locations(rgb, number_of_times_to_upsample=1)
+        face_encodings = face_recognition.face_encodings(rgb, face_locations)
+
+        if not face_encodings:
+            return {"faces_detected": 0, "recognized": [], "message": "No faces detected in current frame"}
+
+        # Get all students and compare
+        students = list(students_col.find())
+        if not students:
+            return {"faces_detected": len(face_encodings), "recognized": [], "message": "No students registered"}
+
+        now = datetime.now()
+        hour_start = now.replace(minute=0, second=0, microsecond=0)
+        hour_end = hour_start + timedelta(hours=1)
+        
+        tolerance = 0.25
+        confidence_threshold = 0.75
+        recognized = []
+        attendance_marked = []
+
+        for encoding in face_encodings:
+            best_match = None
+            best_distance = float('inf')
+            best_confidence = 0
+            
+            for student in students:
+                try:
+                    known_encoding = np.array(student["face_encoding"])
+                    distance = face_recognition.face_distance([known_encoding], encoding)[0]
+                    confidence = (1 - distance) * 100
+                except Exception:
+                    continue
+                
+                if distance < best_distance and distance <= tolerance and confidence >= confidence_threshold:
+                    best_distance = distance
+                    best_confidence = confidence
+                    best_match = student
+
+            if best_match:
+                recognized.append({
+                    "roll": best_match["roll"],
+                    "name": best_match["name"],
+                    "confidence": best_confidence
+                })
+
+                # Check if attendance already marked this hour
+                exists = attendance_col.find_one({
+                    "roll": best_match["roll"],
+                    "timestamp": {"$gte": hour_start, "$lt": hour_end}
+                })
+                
+                if not exists:
+                    attendance_col.insert_one({
+                        "roll": best_match["roll"],
+                        "name": best_match["name"],
+                        "timestamp": now,
+                        "confidence": best_confidence,
+                        "source": "rtsp_manual"
+                    })
+                    attendance_marked.append({
+                        "roll": best_match["roll"],
+                        "name": best_match["name"],
+                        "confidence": best_confidence
+                    })
+
+        return {
+            "faces_detected": len(face_encodings),
+            "recognized": recognized,
+            "attendance_marked": attendance_marked,
+            "message": f"Processed {len(face_encodings)} faces, recognized {len(recognized)} students, marked attendance for {len(attendance_marked)} new students"
+        }
+        
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 # FastAPI startup block
 if __name__ == "__main__":
